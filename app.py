@@ -1,7 +1,8 @@
 # app.py — TruHome Monthly Insights (Investor View)
 # Upload or auto-load a default CSV → clean KPIs, insights, charts,
-# single-store mode, and next-month forecasts (overall & per store).
+# "All months" view, and next-month forecasts (overall & per store).
 
+import os
 import io
 import re
 from dateutil.relativedelta import relativedelta
@@ -10,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- SETTINGS ----------
+# ============== SETTINGS ==============
 DEFAULT_CSV_PATH = "sample/truhome_default.csv"  # put your default CSV here
 APP_TITLE = "📈 TruHome Monthly Insights"
 ALL_MONTHS = "— All months —"
@@ -23,7 +24,7 @@ except Exception:
     HAS_PLOTLY = False
     import altair as alt
 
-# ---------- PAGE ----------
+# ============== PAGE/STYLE ==============
 st.set_page_config(page_title="TruHome Monthly Insights", page_icon="📈", layout="wide")
 st.markdown("""
 <style>
@@ -37,7 +38,7 @@ st.markdown("""
 st.title(APP_TITLE)
 st.caption("Upload your CSV (or use the built-in default) → automatic KPIs, insights, clean charts, and next-month forecasts. Investor-friendly and robust to messy data.")
 
-# ---------- HELPERS ----------
+# ============== HELPERS ==============
 def normalize_colname(x: str) -> str:
     if not isinstance(x, str):
         x = str(x)
@@ -55,6 +56,7 @@ def month_to_dt(m: str) -> pd.Timestamp:
 
 @st.cache_data(show_spinner=False)
 def read_csv_safely(file_like, encoding="utf-8"):
+    """Read csv from upload or path; try latin-1 fallback; return DataFrame or None."""
     try:
         return pd.read_csv(file_like, encoding=encoding)
     except UnicodeDecodeError:
@@ -67,22 +69,27 @@ def read_csv_safely(file_like, encoding="utf-8"):
 
 def detect_schema(df: pd.DataFrame) -> dict:
     norm = {c: normalize_colname(c) for c in df.columns}
+
     store_candidates = {c for c,n in norm.items() if n in {
         "store location","store","location","walmart store","walmart location","store_name","storelocation"
     } or ("store" in n and "promoter" not in n)}
+
     month_text_candidates = {c for c,n in norm.items() if n in {"month year","monthyear","month","month - year"}}
     date_candidates = {c for c,n in norm.items() if n in {"collected at","collected_at","date","created at","created_at"} or "date" in n}
+
     total_leads_candidates = {c for c,n in norm.items() if n in {"total leads collected","total leads","leads"}}
     homeowners_total_candidates = {c for c,n in norm.items() if n in {"total homeowners","homeowners"}}
     renters_total_candidates = {c for c,n in norm.items() if n in {"total renters","renters"}}
     conversion_candidates = {c for c,n in norm.items() if "conversion" in n or n in {
         "homeowner conversion","homeowner conversion %","homeowner conversion percent"
     }}
+
     homeowner_flag_candidates = {c for c,n in norm.items() if n in {"homeowner","homeowner?","is homeowner","homeowner status"} or "homeowner" in n}
     renter_flag_candidates = {c for c,n in norm.items() if n in {"renter","renters?","is renter"} or "renter" in n}
     status_candidates = {c for c,n in norm.items() if n in {"status","lead status"}}
 
     is_aggregated = (len(total_leads_candidates) > 0) and (len(month_text_candidates | date_candidates) > 0) and (len(store_candidates) > 0)
+
     return {
         "store": next(iter(store_candidates), None),
         "month_text": next(iter(month_text_candidates), None),
@@ -98,26 +105,33 @@ def detect_schema(df: pd.DataFrame) -> dict:
     }
 
 def coerce_numeric(s):
+    """Robust numeric coercion: strips %, commas and spaces."""
     return pd.to_numeric(
         s.astype(str).str.replace("%","", regex=False).str.replace(",","", regex=False).str.strip(),
         errors="coerce"
     )
 
 def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize into: ['month','store','leads','homeowners','renters','conversion']."""
+    """
+    Normalize into: ['month','store','leads','homeowners','renters','conversion'].
+    conversion is a fraction in [0,1] or NaN (never >1).
+    """
     mp = detect_schema(df)
     if mp["store"] is None:
         raise ValueError("Could not detect a 'Store' column.")
 
+    # AGGREGATED
     if mp["is_aggregated"]:
         month_col = mp["month_text"] if mp["month_text"] else mp["date"]
         temp = df.copy()
+
         if month_col == mp["date"]:
             temp["__month"] = month_label(pd.to_datetime(temp[month_col], errors="coerce").dt.to_period("M").dt.to_timestamp())
         else:
             temp["__month"] = temp[month_col].astype(str)
 
         store = mp["store"]; leads = mp["total_leads"]; h = mp["total_homeowners"]; r = mp["total_renters"]; conv = mp["conversion"]
+
         for c in [leads, h, r]:
             if c and c in temp.columns:
                 temp[c] = coerce_numeric(temp[c])
@@ -138,6 +152,8 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
             out["conversion"] = np.where(out["leads"]>0, out["homeowners"]/out["leads"], np.nan)
 
         out.rename(columns={"__month":"month", store:"store"}, inplace=True)
+
+    # RAW
     else:
         temp = df.copy()
         date_col = mp["date"] or mp["month_text"]
@@ -150,12 +166,15 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
             temp["month"] = month_label(dt.dt.to_period("M").dt.to_timestamp())
 
         store = mp["store"]
+
         def to_bool(s): return s.astype(str).str.strip().str.lower().isin(["yes","y","true","1"])
-        homeowner = renter = None
+
+        homeowner = None; renter = None
         if mp["homeowner_flag"] and mp["homeowner_flag"] in temp.columns:
             homeowner = to_bool(temp[mp["homeowner_flag"]])
         elif mp["status"] and mp["status"] in temp.columns:
             homeowner = temp[mp["status"]].astype(str).str.lower().str.contains("homeowner")
+
         if mp["renter_flag"] and mp["renter_flag"] in temp.columns:
             renter = to_bool(temp[mp["renter_flag"]])
         elif mp["status"] and mp["status"] in temp.columns:
@@ -172,6 +191,7 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
         out["conversion"] = np.where(out["leads"]>0, out["homeowners"]/out["leads"], np.nan)
         out.rename(columns={store:"store"}, inplace=True)
 
+    # Final cleanups
     out["leads"] = coerce_numeric(out["leads"])
     out["homeowners"] = coerce_numeric(out["homeowners"])
     out["renters"] = coerce_numeric(out["renters"])
@@ -181,7 +201,7 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_values(["store","_dt"])
     return out
 
-# ---- CHART HELPERS ----
+# ---------- CHART HELPERS ----------
 def show_bar(df, x, y, title, color=None, stacked=False, text=None):
     if df is None or df.empty:
         return
@@ -210,7 +230,7 @@ def show_line(df, x, y, title, color=None, percent=False):
         if color: enc["color"] = color
         st.altair_chart(alt.Chart(df).mark_line(point=True).encode(**enc).properties(title=title), use_container_width=True)
 
-# ---- FORECASTS (next month) ----
+# ---------- FORECASTS (next month) ----------
 def forecast_next_month_store(summary_df: pd.DataFrame, store: str):
     ts = summary_df[summary_df["store"] == store].copy()
     if ts.empty:
@@ -229,12 +249,11 @@ def forecast_next_month_overall(summary_df: pd.DataFrame, subset=None):
     """
     Overall forecast for next month across stores (or a subset of stores if provided).
     Forecasts leads/homeowners/renters via 3-month rolling mean on monthly totals.
-    Returns (hist_df, fc_row, None or error string)
     """
     df = summary_df.copy()
     if subset is not None:
         df = df[df["store"].isin(subset)]
-    # monthly totals
+
     monthly = df.groupby("month", as_index=False).agg(
         leads=("leads","sum"),
         homeowners=("homeowners","sum"),
@@ -244,6 +263,7 @@ def forecast_next_month_overall(summary_df: pd.DataFrame, subset=None):
     monthly = monthly.sort_values("_dt").tail(3)
     if monthly.empty:
         return None, None, "Insufficient data."
+
     next_dt = monthly["_dt"].max() + relativedelta(months=+1)
     hist = monthly.rename(columns={"_dt":"date"})[["month","date","leads","homeowners","renters"]]
     fc = pd.DataFrame([{
@@ -251,11 +271,11 @@ def forecast_next_month_overall(summary_df: pd.DataFrame, subset=None):
         "month": month_label(next_dt),
         "leads": float(monthly["leads"].mean()),
         "homeowners": float(monthly["homeowners"].mean()),
-        "renters": float(monthly["renters"].mean())
+        "renters": float(monthly["renters"].mean()),
     }])
     return hist, fc, None
 
-# ---------- SIDEBAR ----------
+# ============== SIDEBAR ==============
 with st.sidebar:
     st.header("Upload & Filters")
     uploaded = st.file_uploader("Upload CSV", type=["csv"])
@@ -274,11 +294,29 @@ with st.sidebar:
     )
     st.checkbox("Show forecast (overall or per selected store)", value=True, key="do_fc")
 
-# ---------- LOAD DATA (upload or default) ----------
-df = read_csv_safely(uploaded) if uploaded else read_csv_safely(DEFAULT_CSV_PATH)
+# ============== LOAD DATA (upload or default) ==============
+def load_uploaded(upl):
+    if upl is None:
+        return None
+    return read_csv_safely(upl)
+
+def load_default(path):
+    if not os.path.exists(path):
+        return None
+    return read_csv_safely(path)
+
+source_label = "uploaded" if uploaded else "default"
+df = load_uploaded(uploaded) if uploaded else load_default(DEFAULT_CSV_PATH)
+
 if df is None:
-    st.error("Could not read a CSV. Upload a file or add a default CSV at `sample/truhome_default.csv`.")
+    if uploaded is None:
+        st.error(f"Default CSV not found/readable at `{DEFAULT_CSV_PATH}`. "
+                 f"Confirm the path (case-sensitive), commit it, then Clear cache & Reboot.")
+    else:
+        st.error("Could not read the uploaded CSV. Please try a UTF-8 CSV exported from Sheets/Airtable.")
     st.stop()
+
+st.caption(f"**Data source:** {source_label} · rows: {len(df):,} · columns: {len(df.columns)}")
 
 # Normalize
 try:
@@ -291,37 +329,33 @@ except Exception as e:
 months = sorted(summary["month"].dropna().unique().tolist(), key=lambda m: month_to_dt(m))
 stores = sorted(summary["store"].dropna().unique().tolist())
 
-# Forecast store dropdown (after data is available)
+# Forecast store dropdown
 with st.sidebar:
     if st.session_state.get("do_fc", False):
         opts = ["— Select a store —"] + stores
         fc_choice = st.selectbox("Forecast store (optional)", opts, index=0, key="fc_store",
-                                 help="Pick a store for a per-store forecast. Leave as 'Select a store' to see overall forecast.")
+                                 help="Pick a store for a per-store forecast. Leave unselected for overall forecast.")
         selected_store_for_fcast = "" if fc_choice == "— Select a store —" else fc_choice
         st.caption("Forecasts show **next month** using a 3-month rolling average.")
 
 # Main filters
 c1, c2 = st.columns([1,3])
 with c1:
-    month_sel = st.selectbox("Month", [ALL_MONTHS] + months, index=len(months))  # latest month by default
+    month_sel = st.selectbox("Month", [ALL_MONTHS] + months, index=len(months))  # default latest month
 with c2:
     store_multi = st.multiselect("Stores (leave empty for all)", stores, default=[])
 
-# Build filtered frames
+# Filtered frames
 filtered = summary.copy()
 if store_multi:
     filtered = filtered[filtered["store"].isin(store_multi)]
+filtered_month = filtered if month_sel == ALL_MONTHS else filtered[filtered["month"] == month_sel]
 
-if month_sel == ALL_MONTHS:
-    filtered_month = filtered.copy()
-else:
-    filtered_month = filtered[filtered["month"] == month_sel]
-
-# single-store mode?
+# Single store mode?
 single_store_mode = (len(store_multi) == 1)
 single_store_name = store_multi[0] if single_store_mode else None
 
-# ---------- KPI TILES ----------
+# ============== KPI TILES ==============
 m_leads = int(coerce_numeric(filtered_month["leads"]).sum() or 0)
 m_home  = int(coerce_numeric(filtered_month["homeowners"]).sum() or 0)
 m_rent  = int(coerce_numeric(filtered_month["renters"]).sum() or 0)
@@ -340,7 +374,7 @@ scope_caption = (
 st.caption(scope_caption)
 st.divider()
 
-# ---------- INSIGHTS ----------
+# ============== INSIGHTS ==============
 st.subheader("Insights")
 
 def store_insights(df_store: pd.DataFrame, exclude_zero_conv=True) -> list[str]:
@@ -358,7 +392,6 @@ def store_insights(df_store: pd.DataFrame, exclude_zero_conv=True) -> list[str]:
         row = x.loc[x[col].idxmax()]
         return row["month"], row[col]
 
-    # worst conversion
     def worst_conv():
         x = d[d["conversion"] > 0] if exclude_zero_conv else d.dropna(subset=["conversion"])
         if x.empty:
@@ -382,16 +415,13 @@ def month_insights(df_m: pd.DataFrame, exclude_zero_conv=True) -> list[str]:
     out = []
     if df_m.empty:
         return out
-    # top store by leads in this selection scope
     x = df_m.sort_values("leads", ascending=False)
     s, v = x.iloc[0]["store"], int(x.iloc[0]["leads"])
     out.append(f"• <b>{s}</b> led in total leads ({v:,}).")
-    # overall conversion
     leads = int(df_m["leads"].sum()); homes = int(df_m["homeowners"].sum())
     conv = (homes/leads) if leads>0 else np.nan
     out.append(f"• Overall conversion is <b>{conv*100:.1f}%</b>.")
     out.append(f"• Homeowners vs. Renters mix: <b>{homes:,}</b> vs <b>{int(df_m['renters'].sum()):,}</b>.")
-    # best/worst conversion stores
     z = df_m[df_m["conversion"] > 0] if exclude_zero_conv else df_m.dropna(subset=["conversion"])
     if not z.empty:
         best = z.sort_values("conversion", ascending=False).iloc[0]
@@ -401,24 +431,22 @@ def month_insights(df_m: pd.DataFrame, exclude_zero_conv=True) -> list[str]:
     return out
 
 def overall_insights(df_scope: pd.DataFrame, exclude_zero_conv=True) -> list[str]:
-    """Insights across ALL MONTHS in scope (no fixed month)."""
     out = []
     if df_scope.empty:
         return out
-    # best month for total leads across all stores
-    monthly = df_scope.groupby("month", as_index=False).agg(leads=("leads","sum"),
-                                                            homeowners=("homeowners","sum"),
-                                                            renters=("renters","sum"))
+    monthly = df_scope.groupby("month", as_index=False).agg(
+        leads=("leads","sum"),
+        homeowners=("homeowners","sum"),
+        renters=("renters","sum")
+    )
     monthly["_dt"] = monthly["month"].apply(month_to_dt)
     mrow = monthly.loc[monthly["leads"].idxmax()]
     out.append(f"• Best <b>Leads</b> month overall: <b>{mrow['month']}</b> ({int(mrow['leads']):,}).")
-    # best conversion month (weighted)
     monthly["conv"] = np.where(monthly["leads"]>0, monthly["homeowners"]/monthly["leads"], np.nan)
     mcv = monthly[monthly["conv"]>0] if exclude_zero_conv else monthly
     if not mcv.empty:
         brow = mcv.loc[mcv["conv"].idxmax()]
         out.append(f"• Best <b>Conversion</b> month overall: <b>{brow['month']}</b> at <b>{brow['conv']*100:.1f}%</b>.")
-    # top store by total leads across all months
     srow = df_scope.groupby("store", as_index=False).agg(leads=("leads","sum")).sort_values("leads", ascending=False).iloc[0]
     out.append(f"• Top store overall: <b>{srow['store']}</b> with <b>{int(srow['leads']):,}</b> leads.")
     return out
@@ -438,7 +466,7 @@ else:
 st.markdown("<div class='small-note'>Tip: select exactly one store to switch to store-over-time mode, or choose “All months” for overall view.</div>", unsafe_allow_html=True)
 st.divider()
 
-# ---------- CHARTS ----------
+# ============== CHARTS ==============
 if single_store_mode:
     dstore = filtered[filtered["store"] == single_store_name].copy()
     if not dstore.empty:
@@ -452,10 +480,8 @@ if single_store_mode:
                   title=f"{single_store_name} — Conversion % over time", percent=True)
 else:
     if month_sel == ALL_MONTHS:
-        # Top stores by total leads across all months
         totals = filtered.groupby("store", as_index=False).agg(leads=("leads","sum")).sort_values("leads", ascending=False).head(top_n)
         show_bar(totals, x="store", y="leads", title=f"Top {len(totals)} Stores by Total Leads — All months", text="leads")
-        # Trend of total leads over time
         trend = filtered.groupby("month", as_index=False).agg(leads=("leads","sum")).sort_values("month", key=lambda s: s.apply(month_to_dt))
         show_line(trend, x="month", y="leads", title="Leads Over Time (All months)")
     else:
@@ -470,7 +496,7 @@ else:
 
 st.divider()
 
-# ---------- FORECASTS (next month) ----------
+# ============== FORECASTS (next month) ==============
 if st.session_state.get("do_fc"):
     if single_store_mode or selected_store_for_fcast:
         st.subheader("Per-Store Forecast — Next Month (3-month rolling average)")
@@ -486,39 +512,42 @@ if st.session_state.get("do_fc"):
             st.markdown(
                 f"<div class='insight'>• Next month for <b>{store_for_fc}</b>: "
                 f"<b>{int(round(next1['leads'])):,}</b> leads "
-                f"({('+' if change>=0 else '')}{(change*100):.1f}% vs last month). "
+                f"({('+' if pd.notna(change) and change >= 0 else '')}{'' if pd.isna(change) else f'{change*100:.1f}'}% vs last month). "
                 f"Method: 3-month rolling average.</div>", unsafe_allow_html=True
             )
     else:
         st.subheader("Overall Forecast — Next Month (3-month rolling average)")
-        # Overall = across selected stores; if none selected, it's all stores
         subset = store_multi if store_multi else None
         hist, fc, err = forecast_next_month_overall(summary, subset=subset)
         if err:
             st.warning(err)
         else:
-            # chart: total leads history + forecast
             plot_df = pd.concat([hist.assign(kind="History"), fc.assign(kind="Forecast")])
             show_line(plot_df, x="month", y="leads", title="Total Leads Forecast — Overall")
-            # KPI-style sentence with H/O/R and conversion
+
+            # KPI sentence with safe delta in percentage points
             lh, hh, rh = hist.iloc[-1]["leads"], hist.iloc[-1]["homeowners"], hist.iloc[-1]["renters"]
             lf, hf, rf = fc.iloc[0]["leads"], fc.iloc[0]["homeowners"], fc.iloc[0]["renters"]
             conv_last = (hh/lh) if lh else np.nan
             conv_next = (hf/lf) if lf else np.nan
+            delta = (conv_next - conv_last) if (pd.notna(conv_next) and pd.notna(conv_last)) else np.nan
+            delta_sign = '+' if pd.notna(delta) and delta >= 0 else ''
+            delta_pp = f"{delta*100:.1f}" if pd.notna(delta) else "—"
+
             st.markdown(
                 f"<div class='insight'>• Next month overall forecast: "
                 f"<b>{int(round(lf)):,}</b> leads, "
                 f"<b>{int(round(hf)):,}</b> homeowners, "
                 f"<b>{int(round(rf)):,}</b> renters. "
                 f"Conversion ~ <b>{(conv_next*100):.1f}%</b> "
-                f"({('+' if (conv_next - conv_last) >= 0 else '')}{((conv_next - conv_last)*100):.1f} pp vs last month}). "
+                f"({delta_sign}{delta_pp} pp vs last month). "
                 f"Method: 3-month rolling average.</div>",
                 unsafe_allow_html=True
             )
 
 st.divider()
 
-# ---------- DOWNLOADS ----------
+# ============== DOWNLOADS ==============
 with st.expander("Download processed data"):
     buf = io.StringIO()
     summary[["month","store","leads","homeowners","renters","conversion"]].to_csv(buf, index=False)
